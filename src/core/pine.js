@@ -321,54 +321,355 @@ export async function save() {
   return { success: true, action: dialogHandled ? 'saved_with_dialog' : 'Ctrl+S_dispatched' };
 }
 
-export async function getConsole() {
-  const editorStatus = await ensurePineEditorOpenDetailed();
-  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
+// These expressions deliberately stay separate: the More menu can render
+// asynchronously after its button is activated, while the Pine Logs widget
+// can take another bounded interval to mount.
+export const PINE_LOGS_OPEN_MORE_EXPRESSION = `
+  /* PINE_LOGS_OPEN_MORE */
+  (function() {
+    function isLayoutVisible(node) {
+      if (!node || node.isConnected !== true) return false;
+      if (document.documentElement && !document.documentElement.contains(node)) return false;
+      var rect = node.getBoundingClientRect();
+      var style = getComputedStyle(node);
+      return rect.width > 0 && rect.height > 0
+        && style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && Number(style.opacity || 1) !== 0;
+    }
+    function isPineEditorUi(node) {
+      if (!isLayoutVisible(node)) return false;
+      var marker = ((node.getAttribute && node.getAttribute('data-name')) || '')
+        + ' ' + (typeof node.className === 'string' ? node.className : '');
+      if (/pine[-_ ]?(dialog|editor)/i.test(marker)) return true;
+      var titles = node.querySelectorAll ? node.querySelectorAll('h1, h2, h3, [class*="title"]') : [];
+      return Array.from(titles).some(function(title) {
+        return /^Pine Editor$/i.test((title.textContent || '').trim());
+      });
+    }
+    function visiblePineEditorRoots() {
+      var candidates = Array.from(document.querySelectorAll(
+        '[role="dialog"], [data-name="pine-dialog"], [class*="pine-dialog"], [class*="pineEditor"], .pine-editor-container'
+      )).filter(isPineEditorUi);
+      return candidates.filter(function(candidate) {
+        return !candidates.some(function(other) {
+          return other !== candidate && other.contains && other.contains(candidate);
+        });
+      });
+    }
+    function isEnabled(node) {
+      return node.disabled !== true
+        && node.getAttribute('disabled') === null
+        && node.getAttribute('aria-disabled') !== 'true';
+    }
 
-  const entries = await evaluate(`
-    (function() {
-      var results = [];
-      var rows = document.querySelectorAll('[class*="consoleRow"], [class*="log-"], [class*="consoleLine"]');
-      if (rows.length === 0) {
-        var bottomArea = document.querySelector('[class*="layout__area--bottom"]')
-          || document.querySelector('[class*="bottom-widgetbar-content"]');
-        if (bottomArea) {
-          rows = bottomArea.querySelectorAll('[class*="message"], [class*="log"], [class*="console"]');
-        }
+    var roots = visiblePineEditorRoots();
+    if (roots.length === 0) {
+      return { attempted: false, method: null, reason: 'pine_editor_ui_root_not_found' };
+    }
+    if (roots.length > 1) {
+      return { attempted: false, method: null, reason: 'ambiguous_pine_editor_ui_roots', root_count: roots.length };
+    }
+
+    var controls = Array.from(roots[0].querySelectorAll('button[title="More"], [role="button"][title="More"]'))
+      .filter(function(control) {
+        return control.getAttribute('title') === 'More'
+          && isLayoutVisible(control)
+          && isEnabled(control);
+      });
+    if (controls.length === 0) {
+      return { attempted: false, method: null, reason: 'visible_enabled_more_button_not_found' };
+    }
+    if (controls.length > 1) {
+      return { attempted: false, method: null, reason: 'ambiguous_visible_enabled_more_buttons', control_count: controls.length };
+    }
+    controls[0].click();
+    return { attempted: true, method: 'more_button', title: 'More' };
+  })()
+`;
+
+export const PINE_LOGS_OPEN_MENU_EXPRESSION = `
+  /* PINE_LOGS_OPEN_MENU */
+  (function() {
+    function isVisible(node) {
+      if (!node || node.isConnected !== true) return false;
+      if (document.documentElement && !document.documentElement.contains(node)) return false;
+      var rect = node.getBoundingClientRect();
+      var style = getComputedStyle(node);
+      return rect.width > 0 && rect.height > 0
+        && style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && Number(style.opacity || 1) !== 0;
+    }
+    function isEnabled(node) {
+      return node.disabled !== true
+        && node.getAttribute('disabled') === null
+        && node.getAttribute('aria-disabled') !== 'true';
+    }
+
+    var menuItems = Array.from(document.querySelectorAll('[role="menuitem"]'));
+    for (var i = 0; i < menuItems.length; i++) {
+      var text = (menuItems[i].textContent || '').trim();
+      if (text === 'Pine logs' && isVisible(menuItems[i]) && isEnabled(menuItems[i])) {
+        menuItems[i].click();
+        return { attempted: true, method: 'pine_logs_menuitem', text: text };
       }
-      if (rows.length === 0) {
-        var pinePanel = document.querySelector('.pine-editor-container')
-          || document.querySelector('[class*="pine-editor"]')
-          || document.querySelector('[class*="layout__area--bottom"]');
-        if (pinePanel) {
-          var allSpans = pinePanel.querySelectorAll('span, div');
-          for (var s = 0; s < allSpans.length; s++) {
-            var txt = allSpans[s].textContent.trim();
-            if (/^\\d{2}:\\d{2}:\\d{2}/.test(txt) || /error|warning|info/i.test(allSpans[s].className)) {
-              rows = Array.from(rows || []);
-              rows.push(allSpans[s]);
+    }
+    return { attempted: false, method: null, reason: 'visible_enabled_pine_logs_menuitem_not_found' };
+  })()
+`;
+
+export const PINE_LOGS_READ_EXPRESSION = `
+  /* PINE_LOGS_READ */
+  (function() {
+    function attribute(node, names) {
+      for (var i = 0; i < names.length; i++) {
+        var value = node && node.getAttribute ? node.getAttribute(names[i]) : null;
+        if (value !== null && String(value).trim() !== '') return String(value).trim();
+      }
+      return null;
+    }
+    function scriptScope(panel) {
+      var names = ['data-script-name', 'data-script-title', 'data-script-id'];
+      function addIdentity(identities, node) {
+        for (var nameIndex = 0; nameIndex < names.length; nameIndex++) {
+          var value = attribute(node, [names[nameIndex]]);
+          if (!value) continue;
+          var alreadyKnown = false;
+          for (var identityIndex = 0; identityIndex < identities.length; identityIndex++) {
+            if (identities[identityIndex].name === value) {
+              alreadyKnown = true;
+              break;
             }
           }
+          if (!alreadyKnown) identities.push({ name: value, selector: names[nameIndex] });
         }
       }
-      for (var i = 0; i < rows.length; i++) {
-        var text = rows[i].textContent.trim();
-        if (!text) continue;
-        var ts = null;
-        var tsMatch = text.match(/^(\\d{4}-\\d{2}-\\d{2}\\s+)?\\d{2}:\\d{2}:\\d{2}/);
-        if (tsMatch) ts = tsMatch[0];
-        var type = 'info';
-        var cls = rows[i].className || '';
-        if (/error/i.test(cls) || /error/i.test(text.substring(0, 30))) type = 'error';
-        else if (/compil/i.test(text.substring(0, 40))) type = 'compile';
-        else if (/warn/i.test(cls)) type = 'warning';
-        results.push({ timestamp: ts, type: type, message: text });
-      }
-      return results;
-    })()
-  `);
 
-  return { success: true, entries: entries || [], entry_count: entries?.length || 0 };
+      // A verified widget-root identity is authoritative. Descendant labels
+      // may belong to stale selector rows and cannot override the root.
+      var rootIdentities = [];
+      addIdentity(rootIdentities, panel);
+      if (rootIdentities.length === 1) {
+        return { name: rootIdentities[0].name, selector: rootIdentities[0].selector, association: 'known' };
+      }
+      if (rootIdentities.length > 1) {
+        return { name: null, selector: null, association: 'ambiguous' };
+      }
+
+      var identityNodes = Array.from(panel.querySelectorAll(
+        '[data-script-name], [data-script-title], [data-script-id]'
+      ));
+      var activeNodes = identityNodes.filter(function(node) {
+        var states = ['aria-selected', 'data-active', 'aria-current', 'data-selected'];
+        for (var stateIndex = 0; stateIndex < states.length; stateIndex++) {
+          var state = attribute(node, [states[stateIndex]]);
+          if (state && /^(true|yes|active|page)$/i.test(state)) return true;
+        }
+        return false;
+      });
+      // Prefer semantically active identities. If none are exposed, do not
+      // promote a lone descendant label; only conflicting explicit labels are
+      // reported as ambiguous so stale selectors cannot be mistaken for the
+      // active script.
+      var candidates = activeNodes.length > 0 ? activeNodes : identityNodes;
+      var identities = [];
+      for (var nodeIndex = 0; nodeIndex < candidates.length; nodeIndex++) {
+        addIdentity(identities, candidates[nodeIndex]);
+      }
+      if (identities.length === 0) {
+        return { name: null, selector: null, association: 'unknown' };
+      }
+      if (identities.length > 1) {
+        return { name: null, selector: null, association: 'ambiguous' };
+      }
+      if (activeNodes.length === 0) {
+        return { name: null, selector: null, association: 'unknown' };
+      }
+      return { name: identities[0].name, selector: identities[0].selector, association: 'known' };
+    }
+    function levelFor(container, messageNode) {
+      var level = attribute(messageNode, ['data-level', 'data-log-level', 'aria-level'])
+        || attribute(container, ['data-level', 'data-log-level', 'aria-level']);
+      if (!level) {
+        var classes = (typeof container.className === 'string' ? container.className : '')
+          + ' ' + (typeof messageNode.className === 'string' ? messageNode.className : '');
+        if (/error/i.test(classes)) level = 'error';
+        else if (/warn/i.test(classes)) level = 'warning';
+        else if (/debug/i.test(classes)) level = 'debug';
+        else if (/info/i.test(classes)) level = 'info';
+      }
+      return level ? String(level).toLowerCase() : 'info';
+    }
+    function parseMessage(text) {
+      var timestamp = null;
+      var message = text;
+      var match = text.match(/^\\[([^\\]]+)\\]\\s*:\\s*([\\s\\S]*)$/);
+      if (!match) match = text.match(/^(\\d{4}-\\d{2}-\\d{2}T[^\\s]+|\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)\\s*[:\\-]\\s*([\\s\\S]*)$/);
+      if (match) {
+        timestamp = match[1].trim();
+        message = match[2].trim();
+      }
+      return { timestamp: timestamp, message: message };
+    }
+    var widgets = Array.from(document.querySelectorAll('div.widgetbar-widget-pine_logs'));
+    var visibleWidgets = widgets.filter(function(widget) {
+      if (!widget || widget.isConnected !== true
+          || (document.documentElement && !document.documentElement.contains(widget))) return false;
+      var rect = widget.getBoundingClientRect();
+      var style = getComputedStyle(widget);
+      return rect.width > 0 && rect.height > 0
+        && style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && Number(style.opacity || 1) !== 0;
+    });
+    if (visibleWidgets.length === 0) {
+      return {
+        mounted: false,
+        entries: [],
+        script_name: null,
+        script_selector: null,
+        script_association: 'unknown',
+        source_scope: 'widgetbar-widget-pine_logs',
+        widget_count: widgets.length,
+        visible_widget_count: 0,
+        reason: 'widget_not_mounted',
+      };
+    }
+
+    if (visibleWidgets.length > 1) {
+      return {
+        mounted: false,
+        ambiguous: true,
+        entries: [],
+        script_name: null,
+        script_selector: null,
+        script_association: 'ambiguous',
+        source_scope: 'widgetbar-widget-pine_logs',
+        widget_count: widgets.length,
+        visible_widget_count: visibleWidgets.length,
+        reason: 'ambiguous_visible_pine_logs_widgets',
+      };
+    }
+    var panel = visibleWidgets[0];
+
+    var scope = scriptScope(panel);
+    var records = [];
+    var containers = Array.from(panel.querySelectorAll('div[class*="logContainer-"]'));
+    for (var i = 0; i < containers.length; i++) {
+      var messages = containers[i].querySelectorAll('span[class*="msg-"]');
+      if (messages.length > 0) records.push({ container: containers[i], node: messages[0] });
+    }
+
+    var entries = [];
+    for (var recordIndex = 0; recordIndex < records.length; recordIndex++) {
+      var record = records[recordIndex];
+      var text = (record.node.textContent || '').trim();
+      if (!text) continue;
+      var parsed = parseMessage(text);
+      if (!parsed.message) continue;
+      var level = levelFor(record.container, record.node);
+      entries.push({
+        timestamp: parsed.timestamp,
+        type: level,
+        level: level,
+        message: parsed.message,
+      });
+    }
+    return {
+      mounted: true,
+      entries: entries,
+      script_name: scope.name,
+      script_selector: scope.selector,
+      script_association: scope.association,
+      source_scope: 'widgetbar-widget-pine_logs',
+      widget_count: widgets.length,
+      visible_widget_count: visibleWidgets.length,
+    };
+  })()
+`;
+
+/**
+ * Normalize entries returned by the structurally scoped Pine Logs expression.
+ * The verified widget/row/message DOM path is the trust boundary; message
+ * text is never classified as source merely because it contains Pine syntax.
+ */
+export function filterPineLogEntries(entries = []) {
+  if (!Array.isArray(entries)) return [];
+  return entries.map(entry => {
+    if (!entry || typeof entry !== 'object') return null;
+    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+    if (!message) return null;
+    const type = entry.type || entry.level || 'info';
+    const level = entry.level ?? null;
+    return {
+      timestamp: entry.timestamp ?? null,
+      type: String(type),
+      level: level === null ? null : String(level),
+      message,
+    };
+  }).filter(Boolean);
+}
+
+export async function getConsole(options = {}) {
+  const deps = options._deps || {};
+  const runEvaluate = deps.evaluate || evaluate;
+  const ensureOptions = deps.ensureOptions
+    ? { ...deps.ensureOptions }
+    : { evaluate: runEvaluate };
+  if (!ensureOptions.evaluate && deps.evaluate) ensureOptions.evaluate = runEvaluate;
+  if (!ensureOptions.sleep && deps.sleep) ensureOptions.sleep = deps.sleep;
+
+  const editorStatus = await ensurePineEditorOpenDetailed(ensureOptions);
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
+
+  const sleep = deps.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const maxAttempts = Math.max(1, Number(deps.logMaxAttempts ?? deps.maxAttempts ?? 20));
+  const intervalMs = Math.max(0, Number(deps.logIntervalMs ?? deps.intervalMs ?? 100));
+
+  const finish = panel => {
+    const entries = filterPineLogEntries(panel?.entries);
+    return {
+      success: true,
+      entries,
+      entry_count: entries.length,
+      source_scope: 'widgetbar-widget-pine_logs',
+      script_name: panel?.script_name || null,
+      script_selector: panel?.script_selector || null,
+      script_association: panel?.script_association || 'unknown',
+    };
+  };
+
+  let panel = await runEvaluate(PINE_LOGS_READ_EXPRESSION);
+  if (panel?.mounted) return finish(panel);
+  if (panel?.ambiguous) {
+    throw new Error(`Pine Logs could not be used: ${panel.reason || 'ambiguous_visible_pine_logs_widgets'}`);
+  }
+
+  const more = await runEvaluate(PINE_LOGS_OPEN_MORE_EXPRESSION);
+  if (!more?.attempted) {
+    throw new Error(`Pine Logs could not be opened: ${more?.reason || 'More control unavailable'}`);
+  }
+
+  let menu = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    menu = await runEvaluate(PINE_LOGS_OPEN_MENU_EXPRESSION);
+    if (menu?.attempted) break;
+    if (attempt < maxAttempts) await sleep(intervalMs);
+  }
+  if (!menu?.attempted) {
+    throw new Error(`Pine Logs could not be opened: ${menu?.reason || 'Pine logs menu item unavailable'}`);
+  }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    panel = await runEvaluate(PINE_LOGS_READ_EXPRESSION);
+    if (panel?.mounted) return finish(panel);
+    if (panel?.ambiguous) {
+      throw new Error(`Pine Logs could not be used: ${panel.reason || 'ambiguous_visible_pine_logs_widgets'}`);
+    }
+    if (attempt < maxAttempts) await sleep(intervalMs);
+  }
+  throw new Error(`Pine Logs could not be mounted after opening Pine logs: ${panel?.reason || 'widget_not_mounted'}`);
 }
 
 export async function smartCompile() {
