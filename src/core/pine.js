@@ -4,73 +4,23 @@
  * They throw on error (callers catch and format).
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
+import {
+  ensurePineEditorOpenDetailed,
+  getPineEditorStateDetailed,
+  runPineEditorOperation,
+} from './pine-editor.js';
 
-// ── Monaco finder (injected into TV page) ──
-const FIND_MONACO = `
-  (function findMonacoEditor() {
-    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
-    if (!container) return null;
-    var el = container;
-    var fiberKey;
-    for (var i = 0; i < 20; i++) {
-      if (!el) break;
-      fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
-      if (fiberKey) break;
-      el = el.parentElement;
-    }
-    if (!fiberKey) return null;
-    var current = el[fiberKey];
-    for (var d = 0; d < 15; d++) {
-      if (!current) break;
-      if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-        var env = current.memoizedProps.value.monacoEnv;
-        if (env.editor && typeof env.editor.getEditors === 'function') {
-          var editors = env.editor.getEditors();
-          if (editors.length > 0) return { editor: editors[0], env: env };
-        }
-      }
-      current = current.return;
-    }
-    return null;
-  })()
-`;
+export async function getPineEditorState(options = {}) {
+  return getPineEditorStateDetailed(options);
+}
 
 /**
  * Opens the Pine Editor panel and waits for Monaco to become available.
- * Returns true if editor is accessible, false on timeout.
+ * Preserves the original public Promise<boolean> contract.
  */
-export async function ensurePineEditorOpen() {
-  const already = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      return m !== null;
-    })()
-  `);
-  if (already) return true;
-
-  await evaluate(`
-    (function() {
-      var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-      if (!bwb) return;
-      if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
-      else if (typeof bwb.showWidget === 'function') bwb.showWidget('pine-editor');
-    })()
-  `);
-
-  await evaluate(`
-    (function() {
-      var btn = document.querySelector('[aria-label="Pine"]')
-        || document.querySelector('[data-name="pine-dialog-button"]');
-      if (btn) btn.click();
-    })()
-  `);
-
-  for (let i = 0; i < 50; i++) {
-    await new Promise(r => setTimeout(r, 200));
-    const ready = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
-    if (ready) return true;
-  }
-  return false;
+export async function ensurePineEditorOpen(options = {}) {
+  const result = await ensurePineEditorOpenDetailed(options);
+  return result.ready;
 }
 
 // ── Pure / offline functions ──
@@ -244,17 +194,20 @@ export async function check({ source }) {
 
 // ── Functions requiring TradingView connection ──
 
-export async function getSource() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor or Monaco not found in React fiber tree.');
+function pineUnavailableMessage(prefix, status) {
+  return `${prefix} (state: ${status?.state || 'unknown'}).`;
+}
 
-  const source = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return null;
-      return m.editor.getValue();
-    })()
-  `);
+export async function getSource(options = {}) {
+  const editorStatus = await ensurePineEditorOpenDetailed(options._deps?.ensureOptions || {});
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
+
+  const result = await runPineEditorOperation(
+    `function(editor) { return editor.getValue(); }`,
+    options._deps?.operationOptions || {}
+  );
+  if (!result?.ok) throw new Error(pineUnavailableMessage('Could not reacquire Pine Editor', result));
+  const source = result.value;
 
   if (source === null || source === undefined) {
     throw new Error('Monaco editor found but getValue() returned null.');
@@ -263,27 +216,23 @@ export async function getSource() {
   return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
 }
 
-export async function setSource({ source }) {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+export async function setSource({ source, _deps }) {
+  const editorStatus = await ensurePineEditorOpenDetailed(_deps?.ensureOptions || {});
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const escaped = JSON.stringify(source);
-  const set = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
-      return true;
-    })()
-  `);
+  const result = await runPineEditorOperation(
+    `function(editor) { editor.setValue(${escaped}); return true; }`,
+    _deps?.operationOptions || {}
+  );
 
-  if (!set) throw new Error('Monaco found but setValue() failed.');
+  if (!result?.ok || !result.value) throw new Error(pineUnavailableMessage('Could not set Pine source', result));
   return { success: true, lines_set: source.split('\n').length };
 }
 
 export async function compile() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const clicked = await evaluate(`
     (function() {
@@ -320,21 +269,17 @@ export async function compile() {
 }
 
 export async function getErrors() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
+  const result = await runPineEditorOperation(`
+    function(editor, env, model) {
+      return env.editor.getModelMarkers({ resource: model.uri }).map(function(mk) {
         return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
       });
-    })()
   `);
+  if (!result?.ok) throw new Error(pineUnavailableMessage('Could not reacquire Pine Editor', result));
+  const errors = result.value || [];
 
   return {
     success: true,
@@ -345,8 +290,8 @@ export async function getErrors() {
 }
 
 export async function save() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const c = await getClient();
   await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
@@ -377,8 +322,8 @@ export async function save() {
 }
 
 export async function getConsole() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const entries = await evaluate(`
     (function() {
@@ -427,8 +372,8 @@ export async function getConsole() {
 }
 
 export async function smartCompile() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const studiesBefore = await evaluate(`
     (function() {
@@ -471,18 +416,14 @@ export async function smartCompile() {
 
   await new Promise(r => setTimeout(r, 2500));
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
+  const errorResult = await runPineEditorOperation(`
+    function(editor, env, model) {
+      return env.editor.getModelMarkers({ resource: model.uri }).map(function(mk) {
         return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
       });
-    })()
   `);
+  if (!errorResult?.ok) throw new Error(pineUnavailableMessage('Could not reacquire Pine Editor', errorResult));
+  const errors = errorResult.value || [];
 
   const studiesAfter = await evaluate(`
     (function() {
@@ -506,8 +447,8 @@ export async function smartCompile() {
 }
 
 export async function newScript({ type }) {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const typeMap = { indicator: 'indicator', strategy: 'strategy', library: 'library' };
   const templates = {
@@ -520,23 +461,18 @@ export async function newScript({ type }) {
 
   // Simply set the source to a new template — this is the most reliable approach
   const escaped = JSON.stringify(template);
-  const set = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
-      return true;
-    })()
-  `);
+  const setResult = await runPineEditorOperation(
+    `function(editor) { editor.setValue(${escaped}); return true; }`
+  );
 
-  if (!set) throw new Error('Monaco editor not found. Ensure Pine Editor is open.');
+  if (!setResult?.ok || !setResult.value) throw new Error(pineUnavailableMessage('Could not set Pine source', setResult));
 
   return { success: true, type, action: 'new_script_created', template: typeMap[type] };
 }
 
 export async function openScript({ name }) {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+  const editorStatus = await ensurePineEditorOpenDetailed();
+  if (!editorStatus.ready) throw new Error(pineUnavailableMessage('Could not open Pine Editor', editorStatus));
 
   const escapedName = JSON.stringify(name.toLowerCase());
 
@@ -569,12 +505,7 @@ export async function openScript({ name }) {
             .then(function(data) {
               var source = data.source || '';
               if (!source) return {error: 'Script source is empty', name: match.scriptName || match.scriptTitle};
-              var m = ${FIND_MONACO};
-              if (m) {
-                m.editor.setValue(source);
-                return {success: true, name: match.scriptName || match.scriptTitle, id: id, lines: source.split('\\n').length};
-              }
-              return {error: 'Monaco editor not found to inject source', name: match.scriptName || match.scriptTitle};
+              return {success: true, name: match.scriptName || match.scriptTitle, id: id, source: source};
             });
         })
         .catch(function(e) { return {error: e.message}; });
@@ -585,7 +516,15 @@ export async function openScript({ name }) {
     throw new Error(result.error);
   }
 
-  return { success: true, name: result.name, script_id: result.id, lines: result.lines, source: 'internal_api', opened: true };
+  const escapedSource = JSON.stringify(result.source);
+  const setResult = await runPineEditorOperation(
+    `function(editor) { editor.setValue(${escapedSource}); return true; }`
+  );
+  if (!setResult?.ok || !setResult.value) {
+    throw new Error(pineUnavailableMessage('Could not set Pine source', setResult));
+  }
+
+  return { success: true, name: result.name, script_id: result.id, lines: result.source.split('\n').length, source: 'internal_api', opened: true };
 }
 
 export async function listScripts() {

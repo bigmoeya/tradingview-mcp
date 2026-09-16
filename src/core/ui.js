@@ -2,6 +2,11 @@
  * Core UI automation logic.
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
+import {
+  CLOSE_PINE_EDITOR_EXPRESSION,
+  ensurePineEditorOpenDetailed,
+  getPineEditorStateDetailed,
+} from './pine-editor.js';
 
 export async function click({ by, value }) {
   const escaped = JSON.stringify(value);
@@ -28,10 +33,92 @@ export async function click({ by, value }) {
   return { success: true, clicked: result };
 }
 
-export async function openPanel({ panel, action }) {
-  const isBottomPanel = panel === 'pine-editor' || panel === 'strategy-tester';
+export async function openPanel({ panel, action, _deps = {} }) {
+  if (panel === 'pine-editor') {
+    const runEvaluate = _deps.evaluate || evaluate;
+    const getState = _deps.getState || getPineEditorStateDetailed;
+    const ensureOpen = _deps.ensureOpen || ensurePineEditorOpenDetailed;
+    const sleep = _deps.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    const maxAttempts = _deps.maxAttempts ?? 50;
+    const intervalMs = _deps.intervalMs ?? 200;
+    const readState = () => getState({ evaluate: runEvaluate });
+    const isOpen = state => !!(state?.pine_ui_visible || state?.state === 'ready');
+    const isVerifiedClosed = state => state?.state === 'pine_ui_absent'
+      && !state?.pine_ui_visible
+      && (state?.visible_container_count || 0) === 0;
+
+    const before = await readState();
+    const wasOpen = isOpen(before);
+    const shouldOpen = action === 'open' || (action === 'toggle' && !wasOpen);
+
+    if (shouldOpen) {
+      if (before.state === 'ready') {
+        return {
+          success: action === 'open',
+          panel,
+          action,
+          was_open: true,
+          performed: action === 'open' ? 'already_open' : 'toggle_failed',
+          pine_editor_state: before.state,
+          attempts: 0,
+        };
+      }
+
+      const result = await ensureOpen({ evaluate: runEvaluate, sleep, maxAttempts, intervalMs });
+      const changed = !wasOpen && !!result.ready;
+      return {
+        success: action === 'toggle' ? changed : !!result.ready,
+        panel,
+        action,
+        was_open: wasOpen,
+        performed: result.ready ? 'opened' : 'open_failed',
+        pine_editor_state: result.state,
+        opened_with: result.opened_with,
+        attempts: result.attempts,
+        open_failure: result.open_failure || undefined,
+      };
+    }
+
+    if (!wasOpen) {
+      return {
+        success: action === 'close',
+        panel,
+        action,
+        was_open: false,
+        performed: action === 'close' ? 'already_closed' : 'toggle_failed',
+        pine_editor_state: before.state,
+        attempts: 0,
+      };
+    }
+
+    const closeResult = await runEvaluate(CLOSE_PINE_EDITOR_EXPRESSION);
+    let state = before;
+    let attempts = 0;
+    if (closeResult?.attempted) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        attempts = attempt;
+        await sleep(intervalMs);
+        state = await readState();
+        if (isVerifiedClosed(state)) break;
+      }
+    }
+    const closed = closeResult?.attempted && isVerifiedClosed(state);
+    return {
+      success: !!closed,
+      panel,
+      action,
+      was_open: true,
+      performed: closed ? 'closed' : 'close_failed',
+      pine_editor_state: state?.state,
+      closed_with: closeResult?.method || null,
+      close_failure: closeResult?.reason || (!closed ? 'pine_editor_remained_open' : undefined),
+      attempts,
+    };
+  }
+
+  const isBottomPanel = panel === 'strategy-tester';
   if (isBottomPanel) {
-    const widgetName = panel === 'pine-editor' ? 'pine-editor' : 'backtesting';
+    const widgetName = 'backtesting';
     const result = await evaluate(`
       (function() {
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
@@ -41,12 +128,10 @@ export async function openPanel({ panel, action }) {
         var action = ${JSON.stringify(action)};
         var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
         var isOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
-        if (panel === 'pine-editor') { var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco'); isOpen = isOpen && !!monacoEl; }
         if (panel === 'strategy-tester') { var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(stratPanel && stratPanel.offsetParent); }
         var performed = 'none';
         if (action === 'open' || (action === 'toggle' && !isOpen)) {
-          if (panel === 'pine-editor') { if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab(); else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
-          else { if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
+          if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName);
           performed = 'opened';
         } else if (action === 'close' || (action === 'toggle' && isOpen)) {
           // hideWidget(name) was removed in newer TradingView builds; fall back to
